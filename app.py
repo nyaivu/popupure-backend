@@ -2,6 +2,10 @@ from flask import Flask, jsonify, request
 from flask_restful import Resource, Api
 from config import initialize_ee, ROI, SCALE, MAX_PIXELS
 import ee
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+import pandas as pd
+import numpy as np
 
 app = Flask(__name__)
 api = Api(app)
@@ -61,7 +65,7 @@ def getCityMap(city):
     else:
         cityString = f'Kota {str.title(cityWithSpace)}'
 
-    population = ee.Image("JRC/GHSL/P2023A/GHS_POP/1975")
+    population = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020")
     indoCities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
 
     if indoCities.size().getInfo() == 0:
@@ -107,7 +111,7 @@ def getCityPopulation(city):
     else:
         cityString = f'Kota {str.title(cityWithSpace)}'
 
-    population = ee.Image("JRC/GHSL/P2023A/GHS_POP/1975")
+    population = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020")
     indoCities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
 
     populationStats = population.reduceRegions(
@@ -131,32 +135,121 @@ def getCityPopulation(city):
 
     return jsonify(clean_list)
 
-@app.route("/population/all")
-def population():
-    population = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020")
-    indoCities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM0_NAME', 'Indonesia'))
+@app.route("/correlation/air-quality/<city>")
+def getAirCorrelation(city):
+    isKabupaten = request.args.get("kabupaten")
+    cityString = str.title(city.replace('-', ' ')) if isKabupaten else f'Kota {str.title(city.replace("-", " "))}'
+    roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
+    
+    pop = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").clip(roi).unmask(0)
+    no2 = ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_NO2") \
+        .filterDate('2024-01-01', '2024-12-31') \
+        .select('tropospheric_NO2_column_number_density') \
+        .median().clip(roi).unmask(0)
 
-    populationStats = population.reduceRegions(
-        collection = indoCities, 
-        reducer = ee.Reducer.sum(), 
-        scale = 100
-    )
-    cityStats = populationStats.select(['ADM2_NAME', 'sum'], retainGeometry=False).getInfo()
-    features = cityStats.get('features', [])
+    stats = no2.addBands(pop).reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=roi.geometry(),
+        scale=1000,
+        maxPixels=1e9
+    ).getInfo()
 
-    # 2. Use a list comprehension to extract only what you need
-    clean_list = {
-        "data": [
-            {
-            "id": f.get("id"),
-            "city": f["properties"].get("ADM2_NAME"),
-            "population": round(f["properties"].get("sum", 0))
-        }
-        for f in features
-        ]
-    } 
+    return jsonify({
+        "pop_density": stats.get('population_count'),
+        "no2_level": stats.get('tropospheric_NO2_column_number_density'),
+        "status": "High Pollution" if stats.get('tropospheric_NO2_column_number_density', 0) > 0.0001 else "Clean Air"
+    })
 
-    return jsonify(clean_list)
+@app.route("/ai/classify-zone/<city>")
+def classify_zone(city):
+    # (Logika filter ROI GAUL tetap sama seperti sebelumnya)
+    isKabupaten = request.args.get("kabupaten")
+    cityString = str.title(city.replace('-', ' ')) if isKabupaten else f'Kota {str.title(city.replace("-", " "))}'
+    roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
+    
+    # 1. Ambil Data dari GEE
+    pop = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").clip(roi).unmask(0)
+    no2 = ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_NO2").filterDate('2024-01-01', '2024-12-31').median().clip(roi).unmask(0)
+    # NDVI sebagai penyeimbang (ruang hijau)
+    landsat_raw = getLandsat('2023-01-01', '2024-12-31')
+    
+    # Cek jumlah gambar dalam koleksi
+    count = landsat_raw.size().getInfo()
+
+    if count > 0:
+        # Jika ada gambar, baru lakukan median dan hitung NDVI
+        img = landsat_raw.median().clip(roi)
+        ndvi = img.normalizedDifference(["SR_B5", "SR_B4"]).rename('nd').unmask(0)
+    else:
+        # Jika kosong (karena awan < 20%), buat citra kosong bernilai 0
+        ndvi = ee.Image.constant(0).rename('nd').clip(roi)
+
+    combined = ee.Image.cat([
+        pop.rename('population_count'),
+        no2.select('tropospheric_NO2_column_number_density'),
+        ndvi
+    ])
+
+    samples_raw = combined.sample(
+        region=roi.geometry(),
+        scale=1000, 
+        numPixels=100,
+        seed=42,
+        geometries=True # WAJIB TRUE agar koordinat ikut terambil
+    ).getInfo()
+
+    if not samples_raw or 'features' not in samples_raw:
+        return jsonify({"error": "Data GEE tidak tersedia untuk kota ini"}), 404
+
+    features = []
+    valid_features = [] # Simpan feature asli untuk koordinat
+    
+    for f in samples_raw['features']:
+        # --- TAMBAHKAN PENGECEKAN GEOMETRY DI SINI ---
+        if f is None or 'geometry' not in f or f['geometry'] is None:
+            continue
+            
+        props = f.get('properties', {})
+        # Pastikan data tidak None sebelum masuk ke AI
+        p = props.get('population_count', 0)
+        n = props.get('tropospheric_NO2_column_number_density', 0)
+        v = props.get('nd', 0)
+        
+        # Tambahkan hanya jika data valid
+        features.append([p, n, v])
+        valid_features.append(f)
+
+    if len(features) < 3:
+        return jsonify({
+            "error": "Data tidak cukup untuk clustering",
+            "details": f"Hanya ditemukan {len(features)} titik dengan geometri valid.",
+            "city": cityString
+        }), 400
+
+    # AI Process
+    df_features = np.array(features)
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(df_features)
+    kmeans = KMeans(n_clusters=3, random_state=0, n_init=10).fit(scaled_features)
+
+    # Gabungkan koordinat
+    points_data = []
+    for i in range(len(features)):
+        coords = valid_features[i]['geometry']['coordinates']
+        points_data.append({
+            "lng": coords[0],
+            "lat": coords[1],
+            "cluster": int(kmeans.labels_[i]),
+            "pop": features[i][0], 
+            "no2": features[i][1],
+            "ndvi": features[i][2]
+        })
+    
+    return jsonify({
+        "city": cityString,
+        "centers": kmeans.cluster_centers_.tolist(),
+        "points": points_data
+    })
 
 if __name__ == '__main__':
     app.run(debug=True)
