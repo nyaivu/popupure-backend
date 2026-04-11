@@ -54,9 +54,40 @@ def get_stats():
         "mean_ndvi": ndvi_value
     })
 
+@app.route("/list-cities")
+def get_list_cities():
+    # 1. Ambil dataset GAUL Level 2 khusus Indonesia
+    indo_cities = ee.FeatureCollection("FAO/GAUL/2015/level2") \
+        .filter(ee.Filter.eq('ADM0_NAME', 'Indonesia'))
+    
+    # 2. Ambil hanya kolom ADM2_NAME dan urutkan
+    # Kita gunakan aggregate_array untuk mengambil list nama kota langsung
+    city_list = indo_cities.aggregate_array('ADM2_NAME').sort().getInfo()
+    
+    # 3. Hilangkan duplikat (jika ada) menggunakan set
+    unique_cities = list(dict.fromkeys(city_list))
+    
+    # 4. Format data agar mudah dibaca frontend
+    # Kamu bisa kirim dalam bentuk array of strings atau array of objects
+    formatted_cities = []
+    for city in unique_cities:
+        # Menghilangkan awalan "Kota " atau "Kabupaten " untuk slug URL jika perlu
+        is_kab = "Kota" not in city
+        slug = city.lower().replace('kota ', '').replace(' ', '-')
+        formatted_cities.append({
+            "name": city,
+            "slug": slug,
+            "is_kabupaten": is_kab
+        })
+
+    return jsonify({
+        "total": len(formatted_cities),
+        "cities": formatted_cities
+    })
+
 @app.route("/map/<city>")
 def getCityMap(city):
-    isKabupaten = request.args.get("kabupaten")
+    isKabupaten = request.args.get("kabupaten") == "true"
 
     cityWithSpace = city.replace('-', ' ')
 
