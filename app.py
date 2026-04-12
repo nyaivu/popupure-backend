@@ -14,6 +14,11 @@ CORS(app)
 cache = Cache(app)
 api = Api(app)
 
+BOUNDARY_DATASET = "FAO/GAUL/2015/level2" 
+
+COL_NAME = "ADM2_NAME"
+COL_COUNTRY = "ADM0_NAME"
+
 class Hello(Resource):
     def get(self):
         initialize_ee()
@@ -30,27 +35,21 @@ def getLandsat(start, end):
 def get_city_roi(cityName, is_kabupaten):
     city_string = str.title(cityName.replace('-', ' ')) if is_kabupaten else f'Kota {str.title(cityName.replace("-", " "))}'
     
-    roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', city_string))
+    roi = ee.FeatureCollection(BOUNDARY_DATASET).filter(ee.Filter.eq(COL_NAME, city_string))
     return roi
 
 @app.route("/list-cities")
+@cache.memoize(timeout=86400)
 def get_list_cities():
-    # 1. Ambil dataset GAUL Level 2 khusus Indonesia
-    indo_cities = ee.FeatureCollection("FAO/GAUL/2015/level2") \
-        .filter(ee.Filter.eq('ADM0_NAME', 'Indonesia'))
+    indo_cities = ee.FeatureCollection(BOUNDARY_DATASET) \
+        .filter(ee.Filter.eq(COL_COUNTRY, 'Indonesia'))
     
-    # 2. Ambil hanya kolom ADM2_NAME dan urutkan
-    # Kita gunakan aggregate_array untuk mengambil list nama kota langsung
-    city_list = indo_cities.aggregate_array('ADM2_NAME').sort().getInfo()
+    city_list = indo_cities.aggregate_array(COL_NAME).sort().getInfo()
     
-    # 3. Hilangkan duplikat (jika ada) menggunakan set
     unique_cities = list(dict.fromkeys(city_list))
     
-    # 4. Format data agar mudah dibaca frontend
-    # Kamu bisa kirim dalam bentuk array of strings atau array of objects
     formatted_cities = []
     for city in unique_cities:
-        # Menghilangkan awalan "Kota " atau "Kabupaten " untuk slug URL jika perlu
         is_kab = "Kota" not in city
         slug = city.lower().replace('kota ', '').replace(' ', '-')
         formatted_cities.append({
@@ -67,11 +66,11 @@ def get_list_cities():
 @app.route("/search-city")
 def search_city():
     query = request.args.get("q", "").title()
-    indo_cities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM0_NAME', 'Indonesia'))
+    indo_cities = ee.FeatureCollection(BOUNDARY_DATASET).filter(ee.Filter.eq(COL_COUNTRY, 'Indonesia'))
     
     # Filter kota yang mengandung kata kunci
-    filtered = indo_cities.filter(ee.Filter.stringContains('ADM2_NAME', query))
-    results = filtered.aggregate_array('ADM2_NAME').getInfo()
+    filtered = indo_cities.filter(ee.Filter.stringContains(COL_NAME, query))
+    results = filtered.aggregate_array(COL_NAME).getInfo()
     
     return jsonify({"results": results})
 
@@ -86,6 +85,19 @@ def get_city_geojson(city):
     
     return jsonify(geojson_data)
 
+@app.route("/map/all-boundaries")
+def get_all_boundaries():
+    # Ambil semua kabupaten/kota di Indonesia
+    all_indo = ee.FeatureCollection(BOUNDARY_DATASET) \
+                 .filter(ee.Filter.eq(COL_COUNTRY, 'Indonesia'))
+    
+    # Beri warna outline saja
+    empty = ee.Image().byte()
+    outline = empty.paint(featureCollection=all_indo, color=1, width=1)
+    
+    map_id = outline.getMapId({'palette': '0000FF'}) # Garis biru
+    return jsonify({'tile_url': map_id['tile_fetcher'].url_format})
+
 @app.route("/map/<city>")
 def get_city_map(city):
     is_kabupaten = request.args.get("kabupaten") == "true"
@@ -98,7 +110,7 @@ def get_city_map(city):
         cityString = f'Kota {str.title(cityWithSpace)}'
 
     population = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020")
-    indo_cities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
+    indo_cities = ee.FeatureCollection(BOUNDARY_DATASET).filter(ee.Filter.eq(COL_NAME, cityString))
 
     if indo_cities.size().getInfo() == 0:
         return jsonify({
@@ -144,14 +156,14 @@ def getCityPopulation(city):
         cityString = f'Kota {str.title(cityWithSpace)}'
 
     population = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020")
-    indo_cities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
+    indo_cities = ee.FeatureCollection(BOUNDARY_DATASET).filter(ee.Filter.eq(COL_NAME, cityString))
 
     populationStats = population.reduceRegions(
         collection = indo_cities, 
         reducer = ee.Reducer.sum(), 
         scale = 100
     )
-    cityStats = populationStats.select(['ADM2_NAME', 'sum'], retainGeometry=False).getInfo()
+    cityStats = populationStats.select([COL_NAME, 'sum'], retainGeometry=False).getInfo()
     
     features = cityStats.get('features', [])
     currentFeature = features[0]
@@ -160,7 +172,7 @@ def getCityPopulation(city):
     clean_list = {
         "data": {
             "id": currentFeature.get("id"),
-            "city": currentFeature["properties"].get("ADM2_NAME"),
+            "city": currentFeature["properties"].get(COL_NAME),
             "population": round(currentFeature["properties"].get("sum", 0))
         }
     } 
@@ -170,8 +182,8 @@ def getCityPopulation(city):
 @app.route("/correlation/air-quality/<city>")
 def getAirCorrelation(city):
     is_kabupaten = request.args.get("kabupaten") == "true"
-    cityString = str.title(city.replace('-', ' ')) if is_kabupaten else f'Kota {str.title(city.replace("-", " "))}'
-    roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
+    roi = get_city_roi(city, is_kabupaten)
+
     
     pop = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").clip(roi).unmask(0)
     no2 = ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_NO2") \
@@ -197,7 +209,8 @@ def getAirCorrelation(city):
 def classify_zone(city):
     is_kabupaten = request.args.get("kabupaten") == "true"
     cityString = str.title(city.replace('-', ' ')) if is_kabupaten else f'Kota {str.title(city.replace("-", " "))}'
-    roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
+    roi = get_city_roi(city, is_kabupaten)
+
     
     pop = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").clip(roi).unmask(0)
     no2 = ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_NO2").filterDate('2024-01-01', '2024-12-31').median().clip(roi).unmask(0)
@@ -293,7 +306,8 @@ def compare_cities():
         name = city_slug.replace('-', ' ').title()
         city_string = name if is_kabupaten else f"Kota {name}"
         
-        roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', city_string))
+        roi = get_city_roi(city_slug, is_kabupaten)
+
         
         # Ambil data rata-rata
         pop = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").clip(roi).unmask(0)
