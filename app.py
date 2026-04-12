@@ -98,6 +98,27 @@ def get_all_boundaries():
     map_id = outline.getMapId({'palette': '0000FF'}) # Garis biru
     return jsonify({'tile_url': map_id['tile_fetcher'].url_format})
 
+@app.route("/find-city")
+def find_city():
+    lat = float(request.args.get('lat'))
+    lng = float(request.args.get('lng'))
+    point = ee.Geometry.Point([lng, lat])
+    
+    # Cari feature yang memuat titik tersebut
+    match = ee.FeatureCollection("FAO/GAUL/2015/level2") \
+              .filterBounds(point).first()
+    
+    if not match.getInfo(): return jsonify({"error": "Luar wilayah"}), 404
+
+    
+    name = match.get('ADM2_NAME').getInfo()
+    slug = name.lower().replace('kota ', '').replace(' ', '-')
+    return jsonify({
+        "name": name,
+        "slug": slug,
+        "is_kabupaten": "Kota" not in name
+    })
+
 @app.route("/map/<city>")
 def get_city_map(city):
     is_kabupaten = request.args.get("kabupaten") == "true"
