@@ -1,13 +1,17 @@
 from flask import Flask, jsonify, request 
 from flask_restful import Resource, Api
+from flask_caching import Cache
 from config import initialize_ee, ROI, SCALE, MAX_PIXELS
 import ee
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 import pandas as pd
 import numpy as np
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
+cache = Cache(app)
 api = Api(app)
 
 class Hello(Resource):
@@ -23,36 +27,11 @@ def getLandsat(start, end):
         .filter(ee.Filter.lt("CLOUD_COVER", 20))
     )
 
-def scale(img):
-    optical = img.select("SR_B.*").multiply(0.0000275).add(-0.2)
-    return img.addBands(optical, None, True)
-
-
-api.add_resource(Hello, '/')
-@app.route("/get-stats")
-def get_stats():
-    start = request.args.get("start")
-    end = request.args.get("end")
-
-    if not start or not end:
-        return jsonify({"error": "Please provide start and end date"}), 400
+def get_city_roi(cityName, is_kabupaten):
+    city_string = str.title(cityName.replace('-', ' ')) if is_kabupaten else f'Kota {str.title(cityName.replace("-", " "))}'
     
-    img = scale(getLandsat(start, end).median()).clip(ROI)
-    ndvi = img.normalizedDifference(["SR_B5", "SR_B4"]).rename("ndvi")
-    stats = ndvi.reduceRegion(
-        reducer = ee.Reducer.mean(),
-        geometry = ROI,
-        scale = SCALE,
-        maxPixels = MAX_PIXELS
-    )
-
-    ndvi_value = stats.get("ndvi").getInfo()
-
-    return jsonify({
-        "start": start,
-        "end": end,
-        "mean_ndvi": ndvi_value
-    })
+    roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', city_string))
+    return roi
 
 @app.route("/list-cities")
 def get_list_cities():
@@ -85,27 +64,49 @@ def get_list_cities():
         "cities": formatted_cities
     })
 
+@app.route("/search-city")
+def search_city():
+    query = request.args.get("q", "").title()
+    indo_cities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM0_NAME', 'Indonesia'))
+    
+    # Filter kota yang mengandung kata kunci
+    filtered = indo_cities.filter(ee.Filter.stringContains('ADM2_NAME', query))
+    results = filtered.aggregate_array('ADM2_NAME').getInfo()
+    
+    return jsonify({"results": results})
+
+@app.route("/geojson/<city>")
+def get_city_geojson(city):
+    is_kabupaten = request.args.get("kabupaten") == "true"
+
+    roi = get_city_roi(city, is_kabupaten)
+    
+    # Mengambil format GeoJSON untuk dirender oleh L.geoJSON di React
+    geojson_data = roi.getInfo()
+    
+    return jsonify(geojson_data)
+
 @app.route("/map/<city>")
-def getCityMap(city):
-    isKabupaten = request.args.get("kabupaten") == "true"
+def get_city_map(city):
+    is_kabupaten = request.args.get("kabupaten") == "true"
 
     cityWithSpace = city.replace('-', ' ')
 
-    if isKabupaten:
+    if is_kabupaten:
         cityString = str.title(cityWithSpace)
     else:
         cityString = f'Kota {str.title(cityWithSpace)}'
 
     population = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020")
-    indoCities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
+    indo_cities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
 
-    if indoCities.size().getInfo() == 0:
+    if indo_cities.size().getInfo() == 0:
         return jsonify({
             "error": f"City '{cityString}' not found in the GAUL database.",
             "suggestion": "Check if it should be a 'kabupaten' or if the spelling matches 'Kota ...'"
         }), 404
 
-    targetCity = indoCities.first()
+    targetCity = indo_cities.first()
 
     if targetCity is None:
         return jsonify({"error": f"City {cityString} not found"}), 404
@@ -133,20 +134,20 @@ def getCityMap(city):
 
 @app.route("/population/<city>")
 def getCityPopulation(city):
-    isKabupaten = request.args.get("kabupaten")
+    is_kabupaten = request.args.get("kabupaten") == "true"
 
     cityWithSpace = city.replace('-', ' ')
 
-    if isKabupaten:
+    if is_kabupaten:
         cityString = str.title(cityWithSpace)
     else:
         cityString = f'Kota {str.title(cityWithSpace)}'
 
     population = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020")
-    indoCities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
+    indo_cities = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
 
     populationStats = population.reduceRegions(
-        collection = indoCities, 
+        collection = indo_cities, 
         reducer = ee.Reducer.sum(), 
         scale = 100
     )
@@ -168,8 +169,8 @@ def getCityPopulation(city):
 
 @app.route("/correlation/air-quality/<city>")
 def getAirCorrelation(city):
-    isKabupaten = request.args.get("kabupaten")
-    cityString = str.title(city.replace('-', ' ')) if isKabupaten else f'Kota {str.title(city.replace("-", " "))}'
+    is_kabupaten = request.args.get("kabupaten") == "true"
+    cityString = str.title(city.replace('-', ' ')) if is_kabupaten else f'Kota {str.title(city.replace("-", " "))}'
     roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
     
     pop = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").clip(roi).unmask(0)
@@ -192,27 +193,23 @@ def getAirCorrelation(city):
     })
 
 @app.route("/ai/classify-zone/<city>")
+@cache.memoize(timeout=86400)
 def classify_zone(city):
-    # (Logika filter ROI GAUL tetap sama seperti sebelumnya)
-    isKabupaten = request.args.get("kabupaten")
-    cityString = str.title(city.replace('-', ' ')) if isKabupaten else f'Kota {str.title(city.replace("-", " "))}'
+    is_kabupaten = request.args.get("kabupaten") == "true"
+    cityString = str.title(city.replace('-', ' ')) if is_kabupaten else f'Kota {str.title(city.replace("-", " "))}'
     roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', cityString))
     
-    # 1. Ambil Data dari GEE
     pop = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").clip(roi).unmask(0)
     no2 = ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_NO2").filterDate('2024-01-01', '2024-12-31').median().clip(roi).unmask(0)
-    # NDVI sebagai penyeimbang (ruang hijau)
+
     landsat_raw = getLandsat('2023-01-01', '2024-12-31')
     
-    # Cek jumlah gambar dalam koleksi
     count = landsat_raw.size().getInfo()
 
     if count > 0:
-        # Jika ada gambar, baru lakukan median dan hitung NDVI
         img = landsat_raw.median().clip(roi)
         ndvi = img.normalizedDifference(["SR_B5", "SR_B4"]).rename('nd').unmask(0)
     else:
-        # Jika kosong (karena awan < 20%), buat citra kosong bernilai 0
         ndvi = ee.Image.constant(0).rename('nd').clip(roi)
 
     combined = ee.Image.cat([
@@ -226,17 +223,16 @@ def classify_zone(city):
         scale=1000, 
         numPixels=100,
         seed=42,
-        geometries=True # WAJIB TRUE agar koordinat ikut terambil
+        geometries=True
     ).getInfo()
 
     if not samples_raw or 'features' not in samples_raw:
         return jsonify({"error": "Data GEE tidak tersedia untuk kota ini"}), 404
 
     features = []
-    valid_features = [] # Simpan feature asli untuk koordinat
+    valid_features = [] 
     
     for f in samples_raw['features']:
-        # --- TAMBAHKAN PENGECEKAN GEOMETRY DI SINI ---
         if f is None or 'geometry' not in f or f['geometry'] is None:
             continue
             
@@ -281,6 +277,52 @@ def classify_zone(city):
         "centers": kmeans.cluster_centers_.tolist(),
         "points": points_data
     })
+
+@app.route("/ai/compare")
+def compare_cities():
+    city1 = request.args.get("city1")
+    city2 = request.args.get("city2")
+    is_kab1 = request.args.get("kab1") == "true"
+    is_kab2 = request.args.get("kab2") == "true"
+
+    if not city1 or not city2:
+        return jsonify({"error": "Harap pilih dua kota untuk dibandingkan"}), 400
+
+    def get_city_data(city_slug, is_kabupaten):
+        # Logika penentuan cityString sama seperti sebelumnya
+        name = city_slug.replace('-', ' ').title()
+        city_string = name if is_kabupaten else f"Kota {name}"
+        
+        roi = ee.FeatureCollection("FAO/GAUL/2015/level2").filter(ee.Filter.eq('ADM2_NAME', city_string))
+        
+        # Ambil data rata-rata
+        pop = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").clip(roi).unmask(0)
+        no2 = ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_NO2") \
+                .filterDate('2023-01-01', '2024-12-31').median().clip(roi).unmask(0)
+        
+        stats = no2.addBands(pop).reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=roi.geometry(),
+            scale=1000,
+            maxPixels=1e9
+        ).getInfo()
+        
+        return {
+            "name": city_string,
+            "population_avg": stats.get('population_count', 0),
+            "no2_avg": stats.get('tropospheric_NO2_column_number_density', 0)
+        }
+
+    try:
+        data1 = get_city_data(city1, is_kab1)
+        data2 = get_city_data(city2, is_kab2)
+        
+        return jsonify({
+            "comparison": [data1, data2],
+            "timestamp": "2024"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
