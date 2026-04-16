@@ -7,18 +7,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def initialize_ee():
-    # Gunakan ID Project kamu
     PROJECT_ID = "wefgis" 
     print("Starting GEE...")
-    t0 = time.time()
-    
     try:
-        # BEST PRACTICE: ee.Initialize() tanpa argumen credentials 
-        # akan otomatis mencari file di path yang ada pada variabel 
-        # GOOGLE_APPLICATION_CREDENTIALS
-        ee.Initialize(project=PROJECT_ID)
-        
-        print(f"Earth Engine initialized successfully in {time.time()-t0:.2f}s")
+        path = "/app/private-key.json"
+        # Memaksa inisialisasi menggunakan file fisik
+        creds = ee.ServiceAccountCredentials('', key_file=path)
+        ee.Initialize(creds, project=PROJECT_ID)
+        print("GEE initialized successfully!")
         return True
     except Exception as e:
         print(f"GEE Initialization failed: {e}")
