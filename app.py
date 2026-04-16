@@ -19,6 +19,14 @@ BOUNDARY_DATASET = "FAO/GAUL/2015/level2"
 COL_NAME = "ADM2_NAME"
 COL_COUNTRY = "ADM0_NAME"
 
+@app.after_request
+def add_header(response):
+    response.headers['ngrok-skip-browser-warning'] = 'true'
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,ngrok-skip-browser-warning'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,PUT,POST,DELETE,OPTIONS'
+    return response
+
 class Hello(Resource):
     def get(self):
         initialize_ee()
