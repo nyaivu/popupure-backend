@@ -7,33 +7,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def initialize_ee():
-    PROJECT_ID = "wefgis"
-    print("Starting GEE")
+    # Gunakan ID Project kamu
+    PROJECT_ID = "wefgis" 
+    print("Starting GEE...")
     t0 = time.time()
-    gee_json_str = os.environ.get('GEE_JSON')
-
-    # 1. Try Environment Variable
-    if gee_json_str:
-        try:
-            key_data = json.loads(gee_json_str)
-            credentials = ee.ServiceAccountCredentials(
-                key_data['client_email'], 
-                key_data=key_data['private_key']
-            )
-            ee.Initialize(credentials, project=PROJECT_ID)
-            print(f"Earth Engine initialized via Environment Variable in {time.time()-t0:.2f}s")
-            return True # <--- CRITICAL: Tell the script we succeeded
-        except Exception as e:
-            print(f"Failed to initialize with Env Var: {e}")
     
-    # 2. Try Local Fallback (ADC)
     try:
-        print("Env var not found/failed, attempting local file login...")
+        # BEST PRACTICE: ee.Initialize() tanpa argumen credentials 
+        # akan otomatis mencari file di path yang ada pada variabel 
+        # GOOGLE_APPLICATION_CREDENTIALS
         ee.Initialize(project=PROJECT_ID)
-        print("Earth Engine initialized via local default credentials")
-        return True # <--- CRITICAL: Success
+        
+        print(f"Earth Engine initialized successfully in {time.time()-t0:.2f}s")
+        return True
     except Exception as e:
-        print(f"Local auth failed: {e}")
+        print(f"GEE Initialization failed: {e}")
         return False
 
 # --- EXECUTION FLOW ---
