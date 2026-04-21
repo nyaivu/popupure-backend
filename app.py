@@ -46,6 +46,47 @@ def get_city_roi(cityName, is_kabupaten):
     roi = ee.FeatureCollection(BOUNDARY_DATASET).filter(ee.Filter.eq(COL_NAME, city_string))
     return roi
 
+def get_cluster_metadata(center):
+    pop, no2, ndvi = center
+    
+    # 1. Zona Merah (Bahaya)
+    if no2 > 0.5 and pop > 0.5:
+        return {
+            "label": "Zona Merah (Kepadatan & Polusi Tinggi)",
+            "description": "Area urban padat dengan tingkat emisi gas buang yang signifikan.",
+            "color": "#ef4444"
+        }
+    
+    # 2. Zona Oranye (Industri/Transportasi)
+    if no2 > 0.5 and pop <= 0.5:
+        return {
+            "label": "Zona Industri/Transportasi",
+            "description": "Polusi udara tinggi namun pemukiman jarang. Jalur lintas atau kawasan industri.",
+            "color": "#f97316"
+        }
+    
+    # 3. Zona Kuning (Pusat Keramaian)
+    if pop > 2:
+        return {
+            "label": "Pusat Keramaian Utama",
+            "description": "Area dengan konsentrasi penduduk sangat tinggi (Pusat Kota).",
+            "color": "#fbbf24"
+        }
+    
+    # 4. Zona Hijau (Asri)
+    if ndvi > 0.2 or (no2 < 0 and pop < 0):
+        return {
+            "label": "Zona Hijau & Asri",
+            "description": "Area dengan vegetasi baik dan tingkat polusi di bawah rata-rata.",
+            "color": "#22c55e"
+        }
+    
+    return {
+        "label": "Zona Penyangga (Buffer)",
+        "description": "Area transisi dengan karakteristik pemukiman dan polusi moderat.",
+        "color": "#3b82f6"
+    }
+
 @app.route("/list-cities")
 @cache.memoize(timeout=86400)
 def get_list_cities():
@@ -233,6 +274,8 @@ def getAirCorrelation(city):
         "status": "High Pollution" if stats.get('tropospheric_NO2_column_number_density', 0) > 0.0001 else "Clean Air"
     })
 
+
+
 @app.route("/ai/classify-zone/<city>")
 @cache.memoize(timeout=86400)
 def classify_zone(city):
@@ -279,12 +322,10 @@ def classify_zone(city):
             continue
             
         props = f.get('properties', {})
-        # Pastikan data tidak None sebelum masuk ke AI
         p = props.get('population_count', 0)
         n = props.get('tropospheric_NO2_column_number_density', 0)
         v = props.get('nd', 0)
         
-        # Tambahkan hanya jika data valid
         features.append([p, n, v])
         valid_features.append(f)
 
@@ -301,14 +342,26 @@ def classify_zone(city):
     scaled_features = scaler.fit_transform(df_features)
     kmeans = KMeans(n_clusters=3, random_state=0, n_init=10).fit(scaled_features)
 
+    cluster_centers = kmeans.cluster_centers_.tolist()
+    cluster_metadata = []
+    for center in cluster_centers:
+        cluster_metadata.append({
+            "scores": center,
+            "metadata": get_cluster_metadata(center)
+        })
+
     # Gabungkan koordinat
     points_data = []
     for i in range(len(features)):
+        cluster_idx = int(kmeans.labels_[i])
+        assigned_color = cluster_metadata[cluster_idx]["metadata"]["color"]
+        
         coords = valid_features[i]['geometry']['coordinates']
         points_data.append({
             "lng": coords[0],
             "lat": coords[1],
-            "cluster": int(kmeans.labels_[i]),
+            "cluster": cluster_idx,
+            "color": assigned_color, 
             "pop": features[i][0], 
             "no2": features[i][1],
             "ndvi": features[i][2]
@@ -316,7 +369,7 @@ def classify_zone(city):
     
     return jsonify({
         "city": cityString,
-        "centers": kmeans.cluster_centers_.tolist(),
+        "centers": cluster_metadata,
         "points": points_data
     })
 

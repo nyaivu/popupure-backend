@@ -10,7 +10,7 @@ def initialize_ee():
     PROJECT_ID = "wefgis" 
     print("Starting GEE...")
     try:
-        path = "/app/private-key.json"
+        path = "private-key.json"
         # Memaksa inisialisasi menggunakan file fisik
         creds = ee.ServiceAccountCredentials('', key_file=path)
         ee.Initialize(creds, project=PROJECT_ID)
